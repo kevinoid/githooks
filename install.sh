@@ -21,7 +21,7 @@ BASE_TEMPLATE_CONTENT='#!/bin/sh
 # It allows you to have a .githooks folder per-project that contains
 # its hooks to execute on various Git triggers.
 #
-# Version: 1808.152304-674435
+# Version: 1808.161837-66b427
 
 execute_all_hooks_in() {
     PARENT="$1"
@@ -392,21 +392,88 @@ You can find more information about how this all works in the [README](https://g
 If you find it useful, please show your support by starring the project in GitHub!'
 
 ############################################################
+# Execute the full installation process.
+#
+# Returns:
+#   0 when successfully finished, 1 if failed
+############################################################
+execute_installation() {
+    parse_command_line_arguments "$@"
+
+    if is_non_interactive; then
+        disable_tty_input
+    fi
+
+    # Find the directory to install to
+    if is_single_repo_install; then
+        ensure_running_in_git_repo || return 1
+        mark_as_single_install_repo
+    else
+        prepare_target_template_directory || return 1
+    fi
+
+    # Install the hook templates if needed
+    if ! is_single_repo_install; then
+        setup_hook_templates || return 1
+        echo # For visual separation
+    fi
+
+    # Automatic updates
+    if setup_automatic_update_checks; then
+        echo # For visual separation
+    fi
+
+    # Install the hooks into existing local repositories
+    if is_single_repo_install; then
+        install_hooks_into_repo "$(pwd)" || return 1
+    else
+        install_into_existing_repositories || return 1
+    fi
+
+    echo # For visual separation
+
+    # Set up shared hook repositories if needed
+    if ! is_single_repo_install && ! is_non_interactive; then
+        setup_shared_hook_repositories
+        echo # For visual separation
+    fi
+}
+
+############################################################
+# Set up variables based on command line arguments.
+#
+# Sets ${DRY_RUN} for --dry-run
+# Sets ${NON_INTERACTIVE} for --non-interactive
+# Sets ${SINGLE_REPO_INSTALL} for --single
+#
+# Returns:
+#   None
+############################################################
+parse_command_line_arguments() {
+    for p in "$@"; do
+        if [ "$p" = "--dry-run" ]; then
+            DRY_RUN="yes"
+        elif [ "$p" = "--non-interactive" ]; then
+            NON_INTERACTIVE="yes"
+        elif [ "$p" = "--single" ]; then
+            SINGLE_REPO_INSTALL="yes"
+        fi
+    done
+}
+
+############################################################
 # Check if the install script is
 #   running in 'dry-run' mode.
 #
 # Returns:
-#   'yes' or 'no' as string
+#   0 in dry-run mode, 1 otherwise
 ############################################################
 is_dry_run() {
-    for p in "$@"; do
-        if [ "$p" = "--dry-run" ]; then
-            echo "yes"
-            return
-        fi
-    done
-
-    echo "no"
+    if [ "$DRY_RUN" = "yes" ]; then
+        return 0
+    else
+        return 1
+    fi
 }
 
 ############################################################
@@ -417,13 +484,11 @@ is_dry_run() {
 #   0 in non-interactive mode, 1 otherwise
 ############################################################
 is_non_interactive() {
-    for p in "$@"; do
-        if [ "$p" = "--non-interactive" ]; then
-            return 0
-        fi
-    done
-
-    return 1
+    if [ "$NON_INTERACTIVE" = "yes" ]; then
+        return 0
+    else
+        return 1
+    fi
 }
 
 ############################################################
@@ -431,17 +496,73 @@ is_non_interactive() {
 #   running in for a single repository without templates.
 #
 # Returns:
-#   'yes' or 'no' as string
+#   0 in single repository install mode, 1 otherwise
 ############################################################
 is_single_repo_install() {
-    for p in "$@"; do
-        if [ "$p" = "--single" ]; then
-            echo "yes"
-            return
-        fi
-    done
+    if [ "$SINGLE_REPO_INSTALL" = "yes" ]; then
+        return 0
+    else
+        return 1
+    fi
+}
 
-    echo "no"
+############################################################
+# Disable user input by redirecting /dev/null
+#   to the standard input of the install script.
+#
+# Returns:
+#   None
+############################################################
+disable_tty_input() {
+    exec </dev/null
+}
+
+############################################################
+# Checks whether the current working directory
+#   is a Git repository or not.
+#
+# Returns:
+#   1 if failed, 0 otherwise
+############################################################
+ensure_running_in_git_repo() {
+    if ! git status >/dev/null 2>&1; then
+        echo "! The current directory is not Git repository"
+        return 1
+    fi
+}
+
+############################################################
+# Marks the repository in the current working directory
+#   as a single install project for future Githooks
+#   install or update runs.
+#
+# Sets the 'githooks.single.install' configuration.
+#
+# Returns:
+#   None
+############################################################
+mark_as_single_install_repo() {
+    git config githooks.single.install yes
+}
+
+############################################################
+# Prepare the target template directory variable,
+#   and make sure it points to a directory when set.
+#
+# Resets and sets the ${TARGET_TEMPLATE_DIR} variable.
+#
+# Returns:
+#   1 if failed, 0 otherwise
+############################################################
+prepare_target_template_directory() {
+    TARGET_TEMPLATE_DIR=""
+
+    find_git_hook_templates
+
+    if [ ! -d "$TARGET_TEMPLATE_DIR" ]; then
+        echo "Git hook templates directory not found"
+        return 1
+    fi
 }
 
 ############################################################
@@ -607,7 +728,7 @@ setup_new_templates_folder() {
         TILDE_REPLACED="$USER_TEMPLATES"
     fi
 
-    if [ "$DRY_RUN" != "yes" ]; then
+    if ! is_dry_run; then
         if mkdir -p "${TILDE_REPLACED}/hooks"; then
             # Let this one go with or without a tilde
             git config --global init.templateDir "$USER_TEMPLATES"
@@ -629,6 +750,11 @@ setup_new_templates_folder() {
 #   0 on success, 1 on failure
 ############################################################
 setup_hook_templates() {
+    if is_dry_run; then
+        echo "[Dry run] Would install Git hook templates into $TARGET_TEMPLATE_DIR"
+        return 0
+    fi
+
     for HOOK in $MANAGED_HOOK_NAMES; do
         HOOK_TEMPLATE="${TARGET_TEMPLATE_DIR}/${HOOK}"
 
@@ -669,19 +795,32 @@ setup_automatic_update_checks() {
             return 1
         else
             echo "Automatic update checks are currently disabled."
-            printf "Would you like to re-enable them, done once a day after a commit? [Y/n] "
+
+            if is_non_interactive; then
+                return 1
+            else
+                printf "Would you like to re-enable them, done once a day after a commit? [Y/n] "
+            fi
         fi
+
+    elif is_non_interactive; then
+        DO_AUTO_UPDATES="Y"
+
     else
         printf "Would you like to enable automatic update checks, done once a day after a commit? [Y/n] "
+
     fi
 
-    read -r DO_AUTO_UPDATES
+    if ! is_non_interactive; then
+        read -r DO_AUTO_UPDATES
+    fi
+
     if [ -z "$DO_AUTO_UPDATES" ] || [ "$DO_AUTO_UPDATES" = "y" ] || [ "$DO_AUTO_UPDATES" = "Y" ]; then
-        if [ "$SINGLE_REPO_INSTALL" != "yes" ]; then
+        if ! is_single_repo_install; then
             GLOBAL_CONFIG="--global"
         fi
 
-        if [ "$DRY_RUN" = "yes" ]; then
+        if is_dry_run; then
             echo "[Dry run] Automatic update checks would have been enabled"
         elif git config ${GLOBAL_CONFIG} githooks.autoupdate.enabled Y; then
             echo "Automatic update checks are now enabled"
@@ -716,17 +855,23 @@ install_into_existing_repositories() {
         QUESTION_PROMPT="[y/N]"
     fi
 
-    printf 'Do you want to install the hooks into existing repositories? %s ' "$QUESTION_PROMPT"
-    read -r DO_INSTALL
+    if is_non_interactive; then
+        echo "Installing the hooks into existing repositories under $PRE_START_DIR"
+        START_DIR="$PRE_START_DIR"
 
-    if [ "$DO_INSTALL" != "y" ] && [ "$DO_INSTALL" != "Y" ]; then
-        if [ "$HAS_PRE_START_DIR" != "Y" ] || [ -n "$DO_INSTALL" ]; then
-            return 0
+    else
+        printf 'Do you want to install the hooks into existing repositories? %s ' "$QUESTION_PROMPT"
+        read -r DO_INSTALL
+
+        if [ "$DO_INSTALL" != "y" ] && [ "$DO_INSTALL" != "Y" ]; then
+            if [ "$HAS_PRE_START_DIR" != "Y" ] || [ -n "$DO_INSTALL" ]; then
+                return 0
+            fi
         fi
-    fi
 
-    printf 'Where do you want to start the search? [%s] ' "$PRE_START_DIR"
-    read -r START_DIR
+        printf 'Where do you want to start the search? [%s] ' "$PRE_START_DIR"
+        read -r START_DIR
+    fi
 
     if [ "$START_DIR" = "" ]; then
         START_DIR="$PRE_START_DIR"
@@ -745,6 +890,12 @@ install_into_existing_repositories() {
     git config --global githooks.previous.searchdir "$START_DIR"
 
     LOCAL_REPOSITORY_LIST=$(find "$START_DIR" -type d -name .git 2>/dev/null)
+
+    # Sort the list if we can
+    if sort --help >/dev/null 2>&1; then
+        LOCAL_REPOSITORY_LIST=$(echo "$LOCAL_REPOSITORY_LIST" | sort)
+    fi
+
     for EXISTING in $LOCAL_REPOSITORY_LIST; do
         EXISTING_REPO_ROOT=$(dirname "$EXISTING")
         install_hooks_into_repo "$EXISTING_REPO_ROOT"
@@ -774,7 +925,7 @@ install_hooks_into_repo() {
     INSTALLED="no"
 
     for HOOK_NAME in $MANAGED_HOOK_NAMES; do
-        if [ "$DRY_RUN" = "yes" ]; then
+        if is_dry_run; then
             INSTALLED="yes"
             continue
         fi
@@ -803,8 +954,11 @@ install_hooks_into_repo() {
         fi
     done
 
-    # Offer to setup the intro README
-    if [ ! -f "${TARGET_ROOT}/.githooks/README.md" ]; then
+    # Offer to setup the intro README if running in interactive mode
+    if is_non_interactive; then
+        true # Let's skip this in non-interactive mode to avoid polluting the local repos with README files
+
+    elif [ ! -f "${TARGET_ROOT}/.githooks/README.md" ]; then
         if [ "$SETUP_INCLUDED_README" = "s" ] || [ "$SETUP_INCLUDED_README" = "S" ]; then
             true # OK, we already said we want to skip all
 
@@ -835,7 +989,7 @@ install_hooks_into_repo() {
     fi
 
     if [ "$INSTALLED" = "yes" ]; then
-        if [ "$DRY_RUN" = "yes" ]; then
+        if is_dry_run; then
             echo "[Dry run] Hooks would have been installed into $TARGET_ROOT"
         else
             echo "Hooks installed into $TARGET_ROOT"
@@ -900,76 +1054,19 @@ setup_shared_hook_repositories() {
     fi
 }
 
-# Check if we're running in dry-run mode
-DRY_RUN=$(is_dry_run "$@")
+############################################################
+# Prints a thank you message and some more info
+#   when the script is finished.
+#
+# Returns:
+#   None
+############################################################
+thank_you() {
+    echo "All done! Enjoy!"
+    echo
+    echo "Please support the project by starring the project at https://github.com/rycus86/githooks, and report bugs or missing features or improvements as issues. Thanks!"
+}
 
-if is_non_interactive "$@"; then
-    exec </dev/null
-fi
-
-SINGLE_REPO_INSTALL=$(is_single_repo_install "$@")
-
-if [ "$SINGLE_REPO_INSTALL" = "yes" ]; then
-    # Make sure we are in a git repo
-    if ! git status >/dev/null 2>&1; then
-        echo "! The current directory is not Git repository"
-        exit 1
-    fi
-
-    git config githooks.single.install yes
-
-else
-    # Find the Git hook template directory to install into
-    TARGET_TEMPLATE_DIR=""
-
-    find_git_hook_templates
-
-    if [ ! -d "$TARGET_TEMPLATE_DIR" ]; then
-        echo "Git hook templates directory not found"
-        exit 1
-    fi
-
-    # Setup the new hooks in the template directory
-    if [ "$DRY_RUN" = "yes" ]; then
-        echo "[Dry run] Would install Git hook templates into $TARGET_TEMPLATE_DIR"
-
-    elif ! setup_hook_templates; then
-        exit 1
-
-    fi
-
-    echo # For visual separation
-
-fi
-
-# Automatic updates
-if setup_automatic_update_checks; then
-    echo # For visual separation
-fi
-
-# Install the hooks into existing local repositories
-if [ "$SINGLE_REPO_INSTALL" = "yes" ]; then
-    if ! install_hooks_into_repo "$(pwd)"; then
-
-        exit 1
-    fi
-
-else
-    if ! install_into_existing_repositories; then
-        exit 1
-    fi
-
-fi
-
-echo # For visual separation
-
-if [ "$SINGLE_REPO_INSTALL" != "yes" ]; then
-    # Set up shared hook repositories
-    setup_shared_hook_repositories
-
-    echo # For visual separation
-fi
-
-echo "All done! Enjoy!
-
-Please support the project by starring the project at https://github.com/rycus86/githooks, and report bugs or missing features or improvements as issues. Thanks!"
+# Start the installation process
+execute_installation "$@" || exit 1
+thank_you

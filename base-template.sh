@@ -4,8 +4,113 @@
 # It allows you to have a .githooks folder per-project that contains
 # its hooks to execute on various Git triggers.
 #
-# Version: 1808.152304-674435
+# Version: 1808.161837-66b427
 
+#####################################################
+# Execute the current hook,
+#   that in turn executes the hooks in the repo
+#
+# Returns:
+#   0 when successfully finished, 1 otherwise
+#####################################################
+process_git_hook() {
+    are_githooks_disabled && return 0
+    set_main_variables
+    check_for_updates_if_needed
+    execute_old_hook_if_available "$@" || return 1
+    execute_global_shared_hooks "$@" || return 1
+    execute_local_shared_hooks "$@" || return 1
+    execute_all_hooks_in "$(pwd)/.githooks" "$@" || return 1
+}
+
+#####################################################
+# Checks if Githooks is completely disabled
+#   for the current repository or globally.
+#   This can be done with Git config or using
+#   the ${GITHOOKS_DISABLE} environment variable.
+#
+# Returns:
+#   0 when disabled, 1 otherwise
+#####################################################
+are_githooks_disabled() {
+    [ -n "$GITHOOKS_DISABLE" ] && return 0
+
+    GITHOOKS_CONFIG_DISABLE=$(git config --get githooks.disable)
+    if [ "$GITHOOKS_CONFIG_DISABLE" = "y" ] || [ "$GITHOOKS_CONFIG_DISABLE" = "Y" ]; then
+        return 0
+    fi
+
+    return 1
+}
+
+#####################################################
+# Set up the main variables that
+#   we will throughout the hook.
+#
+# Sets ${HOOK_NAME}
+# Sets ${HOOK_FOLDER}
+# Resets ${ACCEPT_CHANGES}
+#
+# Returns:
+#   None
+#####################################################
+set_main_variables() {
+    HOOK_NAME=$(basename "$0")
+    HOOK_FOLDER=$(dirname "$0")
+    ACCEPT_CHANGES=
+}
+
+#####################################################
+# Executes the old hook if we moved one
+#   while installing our hooks.
+#
+# Returns:
+#   1 if the old hook failed, 0 otherwise
+#####################################################
+execute_old_hook_if_available() {
+    if [ -x "${HOOK_FOLDER}/${HOOK_NAME}.replaced.githook" ]; then
+        ABSOLUTE_FOLDER=$(cd "${HOOK_FOLDER}" && pwd)
+        execute_hook "${ABSOLUTE_FOLDER}/${HOOK_NAME}.replaced.githook" "$@" || return 1
+    fi
+}
+
+#####################################################
+# Check if we have shared hooks set up globally,
+#   and execute all of them if we do.
+#
+# Returns:
+#   1 if the hooks fail, 0 otherwise
+#####################################################
+execute_global_shared_hooks() {
+    SHARED_HOOKS=$(git config --global --get githooks.shared)
+
+    if [ -n "$SHARED_HOOKS" ]; then
+        process_shared_hooks "$SHARED_HOOKS" "$HOOK_NAME" "$@" || return 1
+    fi
+}
+
+#####################################################
+# Check if we have shared hooks set up
+#   within the current repository,
+#   and execute all of them if we do.
+#
+# Returns:
+#   1 if the hooks fail, 0 otherwise
+#####################################################
+execute_local_shared_hooks() {
+    if [ -f "$(pwd)/.githooks/.shared" ]; then
+        SHARED_HOOKS=$(grep -E "^[^#].+$" <"$(pwd)/.githooks/.shared")
+        process_shared_hooks "$SHARED_HOOKS" "$HOOK_NAME" "$@" || return 1
+    fi
+}
+
+#####################################################
+# Executes all hook files or scripts in the
+#   directory passed in on the first argument.
+#
+# Returns:
+#   1 if the hooks fail, 0 otherwise
+#####################################################
 execute_all_hooks_in() {
     PARENT="$1"
     shift
@@ -13,33 +118,47 @@ execute_all_hooks_in() {
     # Execute all hooks in a directory, or a file named as the hook
     if [ -d "${PARENT}/${HOOK_NAME}" ]; then
         for HOOK_FILE in "${PARENT}/${HOOK_NAME}"/*; do
-            if ! execute_hook "$HOOK_FILE" "$@"; then
-                return 1
-            fi
+            execute_hook "$HOOK_FILE" "$@" || return 1
         done
 
     elif [ -f "${PARENT}/${HOOK_NAME}" ]; then
-        if ! execute_hook "${PARENT}/${HOOK_NAME}" "$@"; then
-            return 1
-        fi
+        execute_hook "${PARENT}/${HOOK_NAME}" "$@" || return 1
 
     fi
-
-    return 0
 }
 
+#####################################################
+# Executes a single hook file or script
+#   at the path passed in on the first argument.
+#
+# Returns:
+#   0 if the hook is ignored,
+#     otherwise the exit code of the hook
+#####################################################
 execute_hook() {
     HOOK_PATH="$1"
     shift
 
+    # stop if the file does not exist
+    [ -f "$HOOK_PATH" ] || return 0
+
+    # stop if the file is ignored
+    is_file_ignored && return 0
+
+    check_and_execute_hook "$@"
+    return $?
+}
+
+#####################################################
+# Checks if the hook file at ${HOOK_PATH}
+#   is ignored and should not be executed.
+#
+# Returns:
+#   0 if ignored, 1 otherwise
+#####################################################
+is_file_ignored() {
     HOOK_FILENAME=$(basename "$HOOK_PATH")
     IS_IGNORED=""
-
-    # If the ${GITHOOKS_DISABLE} environment variable is set,
-    #   do not execute any of the hooks.
-    if [ -n "$GITHOOKS_DISABLE" ]; then
-        return 0
-    fi
 
     # If there are .ignore files, read the list of patterns to exclude.
     ALL_IGNORE_FILE=$(mktemp)
@@ -67,20 +186,14 @@ execute_hook() {
     # Remove the temporary file
     rm -f "$ALL_IGNORE_FILE"
 
-    # If this file is ignored, stop
     if [ -n "$IS_IGNORED" ]; then
         return 0
+    else
+        return 1
     fi
-
-    check_and_execute "$@"
-    return $?
 }
 
-check_and_execute() {
-    if ! [ -f "$HOOK_PATH" ]; then
-        return 0
-    fi
-
+check_and_execute_hook() {
     TRUSTED_REPO=
 
     if [ -f ".githooks/trust-all" ]; then
@@ -214,28 +327,20 @@ process_shared_hooks() {
         fi
 
         if [ -d "${SHARED_ROOT}/.githooks" ]; then
-            if ! execute_all_hooks_in "${SHARED_ROOT}/.githooks" "$@"; then
-                return 1
-            fi
+            execute_all_hooks_in "${SHARED_ROOT}/.githooks" "$@" || return 1
         elif [ -d "$SHARED_ROOT" ]; then
-            if ! execute_all_hooks_in "$SHARED_ROOT" "$@"; then
-                return 1
-            fi
+            execute_all_hooks_in "$SHARED_ROOT" "$@" || return 1
         fi
     done
 
     return 0
 }
 
-check_for_updates() {
-    if [ "$HOOK_NAME" != "post-commit" ]; then
-        return
-    fi
+check_for_updates_if_needed() {
+    [ "$HOOK_NAME" != "post-commit" ] && return
 
     UPDATES_ENABLED=$(git config --get githooks.autoupdate.enabled)
-    if [ "$UPDATES_ENABLED" != "Y" ]; then
-        return
-    fi
+    [ "$UPDATES_ENABLED" != "Y" ] && return
 
     LAST_UPDATE=$(git config --global --get githooks.autoupdate.lastrun)
     if [ -z "$LAST_UPDATE" ]; then
@@ -305,46 +410,4 @@ check_for_updates() {
     fi
 }
 
-# Bail out early if Githooks is disabled
-GITHOOKS_CONFIG_DISABLE=$(git config --get githooks.disable)
-if [ "$GITHOOKS_CONFIG_DISABLE" = "y" ] || [ "$GITHOOKS_CONFIG_DISABLE" = "Y" ]; then
-    exit 0
-fi
-
-HOOK_NAME=$(basename "$0")
-HOOK_FOLDER=$(dirname "$0")
-ACCEPT_CHANGES=
-
-# Check for updates first, if needed
-check_for_updates
-
-# Execute the old hook if we moved it when installing our hooks.
-if [ -x "${HOOK_FOLDER}/${HOOK_NAME}.replaced.githook" ]; then
-    ABSOLUTE_FOLDER=$(cd "${HOOK_FOLDER}" && pwd)
-
-    if ! execute_hook "${ABSOLUTE_FOLDER}/${HOOK_NAME}.replaced.githook" "$@"; then
-        exit 1
-    fi
-fi
-
-# Check for shared hooks set globally
-SHARED_HOOKS=$(git config --global --get githooks.shared)
-
-if [ -n "$SHARED_HOOKS" ]; then
-    if ! process_shared_hooks "$SHARED_HOOKS" "$HOOK_NAME" "$@"; then
-        exit 1
-    fi
-fi
-
-# Check for shared hooks within the current repo
-if [ -f "$(pwd)/.githooks/.shared" ]; then
-    SHARED_HOOKS=$(grep -E "^[^#].+$" <"$(pwd)/.githooks/.shared")
-    if ! process_shared_hooks "$SHARED_HOOKS" "$HOOK_NAME" "$@"; then
-        exit 1
-    fi
-fi
-
-# Execute all hooks in a directory, or a file named as the hook
-if ! execute_all_hooks_in "$(pwd)/.githooks" "$@"; then
-    exit 1
-fi
+process_git_hook "$@" || exit 1
